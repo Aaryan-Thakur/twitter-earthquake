@@ -1,106 +1,62 @@
-from sklearn.feature_extraction.text import CountVectorizer, TfidfVectorizer
-from sklearn.model_selection import train_test_split
-from sklearn.naive_bayes import BernoulliNB
-from sklearn.metrics import precision_score
-from sklearn import svm
-from sklearn import tree
-
-import json
-import numpy as np
+from pyspark.sql import SparkSession
+from pyspark.ml.feature import CountVectorizer, Tokenizer, VectorAssembler
+from pyspark.ml.classification import DecisionTreeClassifier, NaiveBayes, LinearSVC
+from pyspark.ml.evaluation import BinaryClassificationEvaluator
+from pyspark.sql.functions import udf
+from pyspark.sql.types import IntegerType
 import nltk
 
+# Download NLTK resources
 nltk.download("stopwords", quiet=True)
 nltk.download("punkt", quiet=True)
 nltk.download("wordnet", quiet=True)
 
+# Initialize SparkSession
+spark = SparkSession.builder.appName("EarthquakeDetection").getOrCreate()
 
-model = None
-vectorizer = None
-lemmatizer = nltk.stem.WordNetLemmatizer()
-stemmer = nltk.stem.PorterStemmer()
-
-
-# remove punctuation, lemmatize and stem
+# Create UDFs for text preprocessing
 def preprocess_tweet(text):
-    tweet = nltk.wordpunct_tokenize(text)
-    tweet = [w.lower() for w in tweet if w.isalpha()]
-    tweet = map(lemmatizer.lemmatize, tweet)
-    tweet = " ".join(map(stemmer.stem, tweet))
-    return tweet
+    lemmatizer = nltk.stem.WordNetLemmatizer()
+    stemmer = nltk.stem.PorterStemmer()
+    words = nltk.word_tokenize(text)
+    words = [word.lower() for word in words if word.isalpha()]
+    words = [lemmatizer.lemmatize(word) for word in words]
+    words = [stemmer.stem(word) for word in words]
+    return " ".join(words)
 
+preprocess_tweet_udf = udf(preprocess_tweet)
 
-def build_dataset(vectorizers, with_agency=False, test_ratio=0.2):
-    x_text = []
-    y = []
+# Load the dataset as a DataFrame
+data = spark.read.json("dataset.json")
 
-    with open("dataset.json", "r") as f:
-        for line in f:
-            data = json.loads(line)
-            text = data["text"]
-            text = preprocess_tweet(text)
-            if with_agency == False:
-                if data["y"] != "d":
-                    x_text.append(text)
-                    y.append(0 if data["y"] == "s" else 1)
-            else:
-                x_text.append(text)
-                y.append(0 if data["y"] == "s" else 1)
+# Apply text preprocessing
+data = data.withColumn("text", preprocess_tweet_udf(data["text"]))
 
-    y = np.array(y)
-    x_vect = []
-    for vectorizer in vectorizers:
-        x_vect.append(vectorizer.fit_transform(x_text).toarray())
-    return list(map(lambda w: train_test_split(w, y, test_size=test_ratio), x_vect))
+# Split the data into training and testing sets
+train_data, test_data = data.randomSplit([0.8, 0.2], seed=123)
 
+# Create feature vectorizers
+count_vectorizer = CountVectorizer(inputCol="text", outputCol="features", binary=True, minDF=0.05)
 
-def is_tweet_about_earthquake(text):
-    global vectorizer, model
-    text = preprocess_tweet(text)
+# Train and evaluate models
+classifiers = [
+    ("NaiveBayes", NaiveBayes(), BinaryClassificationEvaluator(metricName="areaUnderROC")),
+    ("DecisionTree", DecisionTreeClassifier(maxDepth=10), BinaryClassificationEvaluator(metricName="areaUnderROC")),
+    ("LinearSVC", LinearSVC(), BinaryClassificationEvaluator(metricName="areaUnderROC"))
+]
 
-    # Model and vectorizer do not exist yet, create them
-    if model == None:
-        vectorizer, model = CountVectorizer(
-            binary=True, min_df=0.05
-        ), tree.DecisionTreeClassifier(criterion="entropy", max_depth=5)
-        x_train, x_test, y_train, y_test = build_dataset(
-            [vectorizer], with_agency=True, test_ratio=1
-        )[0]
-        model.fit(x_train, y_train)
+results = []
 
-        # Export the decision tree in .dot format, `dot -Tpng model.dot > model.png; display model.png` to show it
-        dot_str = tree.export_graphviz(
-            model, feature_names=vectorizer.get_feature_names(), impurity=False
-        )
+for classifier_name, classifier, evaluator in classifiers:
+    pipeline = Pipeline(stages=[count_vectorizer, classifier])
+    model = pipeline.fit(train_data)
+    predictions = model.transform(test_data)
+    auc = evaluator.evaluate(predictions)
+    results.append((classifier_name, auc))
 
-        with open("model.dot", "w") as f:
-            f.write(dot_str)
+# Display results
+for classifier_name, auc in results:
+    print(f"{classifier_name}: AUC = {auc}")
 
-    return model.predict(vectorizer.transform([text]).toarray())[0] == True
-
-
-if __name__ == "__main__":
-    print("program starteed")
-    vec_clf_pairs = [
-        (CountVectorizer(binary=True, min_df=0.05), BernoulliNB()),
-        (
-            CountVectorizer(binary=True, min_df=0.05),
-            tree.DecisionTreeClassifier(criterion="entropy", max_depth=10),
-        ),
-        (TfidfVectorizer(min_df=0.05), svm.SVC()),
-    ]
-
-    datasets = build_dataset((x[0] for x in vec_clf_pairs), with_agency=True)
-
-    for (x_train, x_test, y_train, y_test), clf in zip(
-        datasets, [w[1] for w in vec_clf_pairs]
-    ):
-        clf.fit(x_train, y_train)
-        print(
-            "%-30.30s accuracy: %.3lf precision: %.3lf"
-            % (
-                clf.__class__.__name__,
-                clf.score(x_test, y_test),
-                precision_score(y_test, clf.predict(x_test)),
-            )
-        )
-        # print(clf.predict("Is there an earthquake?"))
+# Stop the SparkSession
+spark.stop()

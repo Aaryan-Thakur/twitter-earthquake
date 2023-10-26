@@ -1,29 +1,19 @@
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import from_unixtime
+from pyspark.sql.types import StringType, IntegerType, StructType, StructField
 import twint
-import sqlite3
-from datetime import datetime, timedelta
-import sys
-import json
 import os
+import json
+from datetime import datetime, timedelta
 
-import termios, tty
-def _getch():
-   fd = sys.stdin.fileno()
-   old_settings = termios.tcgetattr(fd)
-   try:
-      tty.setraw(fd)
-      ch = sys.stdin.read(1)     #This number represents the length
-   finally:
-      termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-   return ch
+# Initialize SparkSession
+spark = SparkSession.builder.appName("EarthquakeTweetsProcessing").getOrCreate()
 
-connection = sqlite3.connect('earthquakes.db')
-c = connection.cursor()
+DELTA = 2  # hours from the start of an earthquake
 
+ROWS, COLS = (25, 80)  # You can adjust the number of rows and columns as needed
 
-DELTA = 2 # hours from start of earthquake 
-
-ROWS, COLS = map(int, os.popen('stty size', 'r').read().split()) # rows and cols of console
-
+# Change this part to match your command-line argument processing
 assert len(sys.argv) == 3 and sys.argv[1] == '-id' and 0 <= int(sys.argv[2]) <= 2, 'No'
 userid = int(sys.argv[2])
 
@@ -32,93 +22,47 @@ ds_fname = 'dataset.json'
 if not os.path.isfile('dataset.json'):
     open(ds_fname, 'a').close()
 
-blocklist = ['Earthquake Map',
-             'Quake Reports',
-             'Sismo Mapa',
-             'Earthquake Alerts',
-             'Every Earthquake',
-             'SF QuakeBot',
-             'EMSC',
-             'CA Earthquake Bot',
-             'CA/NV Earthquakes',
-             'Southern CA Quakes',
-             'San Diego Earthquake',
-             'Large Quakes SF'] # inclusivity 100
+blocklist = ['Earthquake Map', 'Quake Reports', 'Sismo Mapa', 'Earthquake Alerts', 'Every Earthquake',
+             'SF QuakeBot', 'EMSC', 'CA Earthquake Bot', 'CA/NV Earthquakes', 'Southern CA Quakes',
+             'San Diego Earthquake', 'Large Quakes SF']  # inclusivity 100
 
+# Define the schema for the earthquakes DataFrame
+earthquakes_schema = StructType([
+    StructField("id", StringType(), False),
+    StructField("latS", StringType(), False),
+    StructField("lonE", StringType(), False),
+    StructField("timestamp", IntegerType(), False)
+])
 
-result_set = c.execute('''select id, latS, lonE, timestamp
-                          from earthquakes
-                          where timestamp %% 3 = %d
-                          order by felt
-                          desc''' % userid)
+# Load earthquake data from SQLite into a DataFrame
+earthquakes_df = spark.read.format("jdbc").options(
+    url="jdbc:sqlite:earthquakes.db",
+    dbtable="earthquakes",
+    driver="org.sqlite.JDBC"
+).schema(earthquakes_schema).load()
 
-with open(ds_fname, 'r') as f:
-    dataset = [json.loads(x)['tid'] for x in f]
+# User-Defined Function (UDF) for reverse geocoding
+def reverse_geocode(latS, lonE):
+    # Implement reverse geocoding logic here using libraries like geopy
+    # Return the geocoded location
+    pass
 
-for id, latS, lonE, ts in result_set:
-    since = datetime.fromtimestamp(ts)
-    until = since + timedelta(hours = DELTA)
-    
-    c = twint.Config()
-    
-    c.Search      = 'earthquake'
-    c.Since       = str(since)
-    c.Until       = str(until)
-    c.Geo         = '%lf,%lf,50km' % (latS, lonE)
-    c.Output      = 'tweets.json'
-    c.Store_json  = True
-    c.Hide_output = True
-    
-    twint.run.Search(c)
-    
-    if os.path.exists('tweets.json'):
+spark.udf.register("reverse_geocode", reverse_geocode)
 
-        tweets = []
-        for line in open('tweets.json'):
-            tweet = json.loads(line)
-            tid   = tweet['id']
-            user  = tweet['name']
+# Define a UDF for fetching earthquake tweets and processing them
+def process_earthquake_tweets(id, latS, lonE, ts, ds_fname, blocklist):
+    # Implement the tweet processing logic here
+    pass
 
-            if tid in dataset:
-                continue
-            if user in blocklist:
-                continue
+# Register the UDF
+spark.udf.register("process_earthquake_tweets", process_earthquake_tweets)
 
-            tweets.append(tweet)
-            
+# Apply the UDF to process earthquake tweets for each row in the earthquakes DataFrame
+result_df = earthquakes_df.withColumn(
+    "result", expr("process_earthquake_tweets(id, latS, lonE, timestamp, ds_fname, blocklist)"))
 
-        for tweet in tweets:
-            text  = tweet['tweet']
-            tid   = tweet['id']
-            hid   = id
-            user  = tweet['name']
-            
-            sys.stdout.write('\b' * (ROWS * COLS))
-            x = user + '\n' + text
-            xrows = 1 + text.count('\n') + round(len(text) / float(COLS) + 0.5)
-            
-            sys.stdout.write(x)
-            sys.stdout.write('\n' * (ROWS - xrows - 3))
-            
-            sys.stdout.write('a - tweet is about earthquakes\ns - tweet is not about earthquakes\nd - unsure or from some agency\n')
-            sys.stdout.flush()
-            
-            y = None
-            while y not in ['a', 's', 'd', 'q']:
-                y = _getch()
+# Show the resulting DataFrame (the "result" column will contain the processed tweet data)
+result_df.show()
 
-            if y == 'q':
-                os.unlink('tweets.json')
-                exit(0)
-            
-            output = json.dumps( {'text' : text, 'y' : y, 'tid' : tid, 'hid' : hid} )
-            
-            with open(ds_fname, 'a') as f:
-                f.write(output + '\n')
-            os.system('clear')
-            
-        os.unlink('tweets.json')
-            
-    
-
-
+# Stop the SparkSession
+spark.stop()
